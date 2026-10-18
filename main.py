@@ -302,11 +302,6 @@ async def get_second_entity():
     except Exception:
         pass
 
-    # Check Turso entity_cache
-    row = db_fetchone("SELECT access_hash FROM entity_cache WHERE user_id = ?", (SECOND_ID,))
-    if row:
-        return types.InputPeerUser(SECOND_ID, row[0])
-
     # Check dialogs
     try:
         async for dialog in client.iter_dialogs(limit=50):
@@ -320,6 +315,11 @@ async def get_second_entity():
                 return dialog.input_entity
     except Exception:
         pass
+
+    # Check Turso entity_cache with valid non-zero access hash
+    row = db_fetchone("SELECT access_hash FROM entity_cache WHERE user_id = ? AND access_hash != 0", (SECOND_ID,))
+    if row and row[0]:
+        return types.InputPeerUser(SECOND_ID, row[0])
 
     return SECOND_ID
 
@@ -993,18 +993,15 @@ async def main():
                     silent=True,
                 )
                 log.info("Sent startup handshake from SECOND to MAIN (@%s)", main_username)
-                sec_me = await sec_client.get_me()
-                if sec_me and getattr(sec_me, "access_hash", None):
-                    db_exec(
-                        "INSERT OR REPLACE INTO entity_cache (user_id, access_hash) VALUES (?, ?)",
-                        (sec_me.id, sec_me.access_hash),
-                    )
-                # Wait 2 seconds for main client to process incoming message and cache entity
+                # Wait 2 seconds for main client to receive and process message
                 await asyncio.sleep(2)
         except Exception as e:
             log.warning("Startup handshake note: %s", e)
 
-    # Resolve target peer entity
+    # Clean any invalid 0 access hash
+    db_exec("DELETE FROM entity_cache WHERE access_hash = 0")
+
+    # Resolve target peer entity directly from client perspective
     target_peer = await get_second_entity()
 
     # Send confirmation to second ID from main account

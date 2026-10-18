@@ -107,6 +107,14 @@ def get_db():
         )
         """
     )
+    _db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS entity_cache (
+            user_id INTEGER PRIMARY KEY,
+            access_hash INTEGER NOT NULL
+        )
+        """
+    )
     _db.commit()
     return _db
 
@@ -275,14 +283,44 @@ async def format_header(msg: Message) -> str:
 # ---------------------------------------------------------------------------
 # Core Forward Logic
 # ---------------------------------------------------------------------------
+async def get_second_entity():
+    """Resolve SECOND_ID peer entity with access_hash fallback from Turso/dialogs."""
+    try:
+        return await client.get_input_entity(SECOND_ID)
+    except Exception:
+        pass
+
+    # Check Turso entity_cache
+    row = db_fetchone("SELECT access_hash FROM entity_cache WHERE user_id = ?", (SECOND_ID,))
+    if row:
+        return types.InputPeerUser(SECOND_ID, row[0])
+
+    # Check dialogs
+    try:
+        async for dialog in client.iter_dialogs(limit=50):
+            if dialog.entity and getattr(dialog.entity, "id", None) == SECOND_ID:
+                access_hash = getattr(dialog.entity, "access_hash", None)
+                if access_hash:
+                    db_exec(
+                        "INSERT OR REPLACE INTO entity_cache (user_id, access_hash) VALUES (?, ?)",
+                        (SECOND_ID, access_hash),
+                    )
+                return dialog.input_entity
+    except Exception:
+        pass
+
+    return SECOND_ID
+
+
 async def forward_to_second(msg: Message):
     """Forward a message to SECOND_ID preserving media, voice notes, formatting, and header."""
     try:
         header = await format_header(msg)
+        target_peer = await get_second_entity()
 
         # 1. Send the header card first
         header_msg = await client.send_message(
-            SECOND_ID,
+            target_peer,
             header,
             silent=True,
             link_preview=False,
@@ -292,7 +330,7 @@ async def forward_to_second(msg: Message):
         sent = None
         try:
             # Native forward preserves voice note waveforms, video note circles, stickers, and albums
-            sent = await client.forward_messages(SECOND_ID, msg, silent=True)
+            sent = await client.forward_messages(target_peer, msg, silent=True)
             if isinstance(sent, list):
                 sent = sent[0]
         except Exception as fwd_err:
@@ -306,7 +344,7 @@ async def forward_to_second(msg: Message):
             )
             if is_file:
                 sent = await client.send_file(
-                    SECOND_ID,
+                    target_peer,
                     file=msg.media,
                     caption=msg.text or None,
                     voice_note=bool(msg.voice),
@@ -315,7 +353,7 @@ async def forward_to_second(msg: Message):
                 )
             else:
                 sent = await client.send_message(
-                    SECOND_ID,
+                    target_peer,
                     msg.text or "[Empty message or unsupported media]",
                     silent=True,
                     link_preview=True,
@@ -666,20 +704,33 @@ async def main():
     if SECOND_SESSION_STRING:
         try:
             async with TelegramClient(StringSession(SECOND_SESSION_STRING), API_ID, API_HASH) as sec_client:
-                # Ensure second account has opened chat with main account so peer cache is populated
+                main_username = me.username or "pyrexus"
+                log.info("Handshake: Resolving main account @%s from second account...", main_username)
+                main_peer = await sec_client.get_entity(main_username)
                 await sec_client.send_message(
-                    me.id,
+                    main_peer,
                     "🟢 **Telegram Bridge Initialized**\nYour bridge is now live and running on Railway.",
                     silent=True,
                 )
-                log.info("Sent startup handshake from SECOND to MAIN")
+                log.info("Sent startup handshake from SECOND to MAIN (@%s)", main_username)
+                sec_me = await sec_client.get_me()
+                if sec_me and getattr(sec_me, "access_hash", None):
+                    db_exec(
+                        "INSERT OR REPLACE INTO entity_cache (user_id, access_hash) VALUES (?, ?)",
+                        (sec_me.id, sec_me.access_hash),
+                    )
+                # Wait 2 seconds for main client to process incoming message and cache entity
+                await asyncio.sleep(2)
         except Exception as e:
             log.warning("Startup handshake note: %s", e)
+
+    # Resolve target peer entity
+    target_peer = await get_second_entity()
 
     # Send confirmation to second ID from main account
     try:
         await client.send_message(
-            SECOND_ID,
+            target_peer,
             f"🟢 **Telegram Bridge Bot is Live & Ready!**\n\n"
             f"• **Main Account:** `{me.first_name}` (`{me.id}`)\n"
             f"• **Target ID:** `{SECOND_ID}`\n"
@@ -689,6 +740,7 @@ async def main():
             silent=True,
         )
         await enforce_offline()
+        log.info("Sent startup confirmation to SECOND_ID successfully")
     except Exception as e:
         log.warning("Could not send startup greeting to SECOND_ID: %s", e)
 

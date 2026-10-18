@@ -250,204 +250,124 @@ def media_kind(msg: Message) -> str:
     return "other_media"
 
 
-async def format_header(msg: Message, reply_author: Optional[str] = None) -> str:
-    """Build a short human-readable header for the forwarded copy."""
-    sender = await msg.get_sender()
-    chat = await msg.get_chat()
-
-    name = "Unknown"
-    if sender:
-        name = getattr(sender, "first_name", "") or ""
-        if getattr(sender, "last_name", None):
-            name += f" {sender.last_name}"
-        uname = getattr(sender, "username", None)
-        if uname:
-            name += f" (@{uname})"
-        name += f" [{getattr(sender, 'id', 'unknown')}]"
-
-    chat_title = getattr(chat, "title", None) or "Private DM"
-    chat_id = msg.chat_id
-
-    kind = "DM"
-    if msg.is_group or msg.is_channel:
-        kind = "GROUP"
-        if msg.mentioned:
-            kind = "MENTION"
-    if msg.is_reply:
-        kind += " (REPLY)"
-
-    time_str = msg.date.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if msg.date else ""
-    lines = [
-        f"── {kind} ──",
-        f"From: {name}",
-        f"Chat: {chat_title} ({chat_id})",
-    ]
-    if reply_author:
-        lines.append(f"In Reply To: {reply_author}")
-    lines.extend([
-        f"MsgID: {msg.id}",
-        f"Time: {time_str}",
-        f"{'─' * 20}",
-    ])
-    return "\n".join(lines)
-
-
 # ---------------------------------------------------------------------------
-# Core Forward Logic (with Replied-To Context Forwarding)
+# Core Forward Logic (Strict Native Forwards, Zero Info Cards)
 # ---------------------------------------------------------------------------
-async def get_second_entity():
-    """Resolve SECOND_ID peer entity with access_hash fallback from Turso/dialogs."""
+async def get_input_peer(chat_id: int):
+    """Resolve an InputPeer for any chat/user with database cache fallback."""
+    # 1. First, check if client already has it in its memory cache
     try:
-        return await client.get_input_entity(SECOND_ID)
+        input_ent = await client.get_input_entity(chat_id)
+        if isinstance(input_ent, types.InputPeerUser) and input_ent.access_hash == 0:
+            pass
+        elif isinstance(input_ent, types.InputPeerChannel) and input_ent.access_hash == 0:
+            pass
+        else:
+            return input_ent
     except Exception:
         pass
 
-    # Check dialogs
+    # 2. Check Turso entity_cache for a valid non-zero access_hash
+    row = db_fetchone("SELECT access_hash FROM entity_cache WHERE user_id = ? AND access_hash != 0", (chat_id,))
+    if row and row[0]:
+        if str(chat_id).startswith("-100"):
+            channel_id = int(str(chat_id)[4:])
+            return types.InputPeerChannel(channel_id, row[0])
+        elif chat_id < 0:
+            return types.InputPeerChat(abs(chat_id))
+        else:
+            return types.InputPeerUser(chat_id, row[0])
+
+    # 3. Check dialogs
     try:
         async for dialog in client.iter_dialogs(limit=50):
-            if dialog.entity and getattr(dialog.entity, "id", None) == SECOND_ID:
+            if dialog.entity and getattr(dialog.entity, "id", None) == chat_id:
                 access_hash = getattr(dialog.entity, "access_hash", None)
                 if access_hash:
                     db_exec(
                         "INSERT OR REPLACE INTO entity_cache (user_id, access_hash) VALUES (?, ?)",
-                        (SECOND_ID, access_hash),
+                        (chat_id, access_hash),
                     )
                 return dialog.input_entity
     except Exception:
         pass
 
-    # Check Turso entity_cache with valid non-zero access hash
-    row = db_fetchone("SELECT access_hash FROM entity_cache WHERE user_id = ? AND access_hash != 0", (SECOND_ID,))
-    if row and row[0]:
-        return types.InputPeerUser(SECOND_ID, row[0])
+    # 4. Try client.get_entity to fetch and cache
+    try:
+        ent = await client.get_entity(chat_id)
+        access_hash = getattr(ent, "access_hash", None)
+        if access_hash:
+            db_exec(
+                "INSERT OR REPLACE INTO entity_cache (user_id, access_hash) VALUES (?, ?)",
+                (chat_id, access_hash),
+            )
+        return await client.get_input_entity(ent)
+    except Exception as e:
+        log.warning("Could not resolve InputPeer for %s: %s", chat_id, e)
 
-    return SECOND_ID
+    return chat_id
 
 
-async def forward_to_second(msg: Message):
+async def get_second_entity():
+    """Resolve SECOND_ID peer entity."""
+    return await get_input_peer(SECOND_ID)
+
+
+async def forward_to_second(msg: Message, input_chat=None):
     """
     Forward a message to SECOND_ID.
-    If the message is a reply, first forwards the original message (thread context)
-    so the user sees exactly what was replied to.
+    Strictly native forwards:
+    - If the message is a reply, first natively forwards the original message (thread context).
+    - Then natively forwards the new message.
+    - Preserves all media (photos, videos, voice notes, stickers, links, docs).
+    - Absolutely NO info headers, NO text banners, NO direct messages without forward.
     """
     try:
         target_peer = await get_second_entity()
-        me = await client.get_me()
 
-        # Check if this message is a reply to another message
-        reply_to_msg = None
-        reply_author_desc = None
+        # 1. If it was a reply, forward the original message being replied to (Thread Context)
         if msg.is_reply:
             try:
                 reply_to_msg = await msg.get_reply_message()
                 if reply_to_msg:
-                    if reply_to_msg.out or reply_to_msg.sender_id == me.id:
-                        reply_author_desc = f"You ({me.first_name})"
+                    if reply_to_msg.chat_id == msg.chat_id and input_chat:
+                        rep_from_peer = input_chat
                     else:
-                        r_sender = await reply_to_msg.get_sender()
-                        r_name = getattr(r_sender, "first_name", "") if r_sender else "User"
-                        r_uname = f" (@{r_sender.username})" if (r_sender and getattr(r_sender, "username", None)) else ""
-                        reply_author_desc = f"{r_name}{r_uname} [{reply_to_msg.sender_id}]"
+                        rep_from_peer = await get_input_peer(reply_to_msg.chat_id)
+
+                    rep_sent = await client.forward_messages(
+                        target_peer,
+                        reply_to_msg.id,
+                        from_peer=rep_from_peer,
+                        silent=True,
+                    )
+                    if isinstance(rep_sent, list):
+                        for s in rep_sent:
+                            save_map(s.id, reply_to_msg.chat_id, reply_to_msg.id)
+                    elif rep_sent:
+                        save_map(rep_sent.id, reply_to_msg.chat_id, reply_to_msg.id)
+                    log.info("Forwarded replied-to msg %s (chat %s) → SECOND_ID", reply_to_msg.id, reply_to_msg.chat_id)
             except Exception as rep_err:
-                log.warning("Could not fetch replied-to message: %s", rep_err)
+                log.warning("Could not forward replied-to message %s: %s", getattr(msg, "reply_to_msg_id", None), rep_err)
 
-        # 1. If it was a reply, forward the original message being replied to (Thread Context)
-        if reply_to_msg:
-            thread_banner = (
-                f"┌── 🔄 REPLIED TO THREAD ──\n"
-                f"│ 👤 Original Sender: {reply_author_desc}\n"
-                f"│ 💬 The user replied to the message below:\n"
-                f"└──────────────────────────"
-            )
-            await client.send_message(target_peer, thread_banner, silent=True)
-
-            try:
-                rep_sent = await client.forward_messages(target_peer, reply_to_msg, silent=True)
-                if isinstance(rep_sent, list):
-                    rep_sent = rep_sent[0]
-                if rep_sent:
-                    save_map(rep_sent.id, reply_to_msg.chat_id, reply_to_msg.id)
-            except Exception as fwd_rep_err:
-                log.warning("Native forward of replied message fallback (%s)", fwd_rep_err)
-                is_file = (
-                    reply_to_msg.media
-                    and not isinstance(
-                        reply_to_msg.media,
-                        (types.MessageMediaWebPage, types.MessageMediaEmpty, types.MessageMediaUnsupported),
-                    )
-                )
-                if is_file:
-                    rep_sent = await client.send_file(
-                        target_peer,
-                        file=reply_to_msg.media,
-                        caption=reply_to_msg.text or None,
-                        voice_note=bool(reply_to_msg.voice),
-                        video_note=bool(reply_to_msg.video_note),
-                        silent=True,
-                    )
-                else:
-                    rep_sent = await client.send_message(
-                        target_peer,
-                        reply_to_msg.text or "[Media/Sticker]",
-                        silent=True,
-                        link_preview=True,
-                    )
-                if isinstance(rep_sent, list):
-                    rep_sent = rep_sent[0]
-                if rep_sent:
-                    save_map(rep_sent.id, reply_to_msg.chat_id, reply_to_msg.id)
-
-        # 2. Build and send the header card for the new reply/message
-        header = await format_header(msg, reply_author=reply_author_desc)
-        header_msg = await client.send_message(
+        # 2. Forward the new message natively
+        from_peer = input_chat if input_chat else await get_input_peer(msg.chat_id)
+        sent = await client.forward_messages(
             target_peer,
-            header,
+            msg.id,
+            from_peer=from_peer,
             silent=True,
-            link_preview=False,
         )
 
-        # 3. Forward the content of the new message
-        sent = None
-        try:
-            # Native forward preserves voice note waveforms, video note circles, stickers, and albums
-            sent = await client.forward_messages(target_peer, msg, silent=True)
-            if isinstance(sent, list):
-                sent = sent[0]
-        except Exception as fwd_err:
-            log.warning("Native forward fallback (%s): sending as copy", fwd_err)
-            is_file = (
-                msg.media
-                and not isinstance(
-                    msg.media,
-                    (types.MessageMediaWebPage, types.MessageMediaEmpty, types.MessageMediaUnsupported),
-                )
-            )
-            if is_file:
-                sent = await client.send_file(
-                    target_peer,
-                    file=msg.media,
-                    caption=msg.text or None,
-                    voice_note=bool(msg.voice),
-                    video_note=bool(msg.video_note),
-                    silent=True,
-                )
-            else:
-                sent = await client.send_message(
-                    target_peer,
-                    msg.text or "[Empty message or unsupported media]",
-                    silent=True,
-                    link_preview=True,
-                )
-            if isinstance(sent, list):
-                sent = sent[0]
-
-        # 4. Save mapping for reply bridge
-        if header_msg:
-            save_map(header_msg.id, msg.chat_id, msg.id)
-        if sent:
+        # 3. Save mapping for reply bridge
+        if isinstance(sent, list):
+            for s in sent:
+                save_map(s.id, msg.chat_id, msg.id)
+            sent = sent[0] if sent else None
+        elif sent:
             save_map(sent.id, msg.chat_id, msg.id)
 
-        # 5. Bump stats
+        # 4. Bump stats
         bump_stat("messages")
         if msg.is_group or msg.is_channel:
             bump_stat("group_msgs")
@@ -461,7 +381,7 @@ async def forward_to_second(msg: Message):
             bump_stat(kind)
             bump_stat("media")
 
-        # 6. Keep account offline
+        # 5. Keep account offline
         await enforce_offline()
 
         log.info("Forwarded %s (chat %s) → SECOND_ID", msg.id, msg.chat_id)
@@ -469,9 +389,9 @@ async def forward_to_second(msg: Message):
     except FloodWaitError as e:
         log.warning("FloodWait %ss – sleeping", e.seconds)
         await asyncio.sleep(e.seconds + 1)
-        return await forward_to_second(msg)
+        return await forward_to_second(msg, input_chat=input_chat)
     except Exception as e:
-        log.exception("Forward failed: %s", e)
+        log.exception("Forward failed for msg %s (chat %s): %s", msg.id, msg.chat_id, e)
         return None
 
 
@@ -738,20 +658,31 @@ async def on_new_message(event: events.NewMessage.Event):
         if msg.is_reply:
             return
 
-        # General message from SECOND_ID
-        await event.reply(
-            "ℹ️ **Bridge Active**\n"
-            f"This chat is connected to your main account @{me.username or me.id}.\n"
-            "• Messages from other users will be forwarded here.\n"
-            "• Reply to any forwarded message to send a reply back from your main account.\n"
-            "• Use `/s <username/id>` to initiate a message to anyone.\n"
-            "• Send `/status` or `/stats` anytime.",
-            silent=True,
-        )
+        # Silently ignore general non-command messages from SECOND_ID
         return
 
-    # Identify sender
-    sender = await msg.get_sender()
+    # Cache sender and chat access hashes
+    sender = None
+    try:
+        sender = await msg.get_sender()
+        if sender and getattr(sender, "access_hash", None):
+            db_exec(
+                "INSERT OR REPLACE INTO entity_cache (user_id, access_hash) VALUES (?, ?)",
+                (sender.id, sender.access_hash),
+            )
+    except Exception:
+        pass
+
+    try:
+        chat = await msg.get_chat()
+        if chat and getattr(chat, "access_hash", None):
+            db_exec(
+                "INSERT OR REPLACE INTO entity_cache (user_id, access_hash) VALUES (?, ?)",
+                (chat.id, chat.access_hash),
+            )
+    except Exception:
+        pass
+
     is_bot = getattr(sender, "bot", False) if sender else False
     uname = (getattr(sender, "username", "") or "").lower()
     is_exception = uname == EXCEPTION_BOT
@@ -762,14 +693,14 @@ async def on_new_message(event: events.NewMessage.Event):
 
     # Private chats (DMs) – always forward
     if event.is_private:
-        await forward_to_second(msg)
+        await forward_to_second(msg, input_chat=event.input_chat)
         return
 
     # Groups / channels – only if we are mentioned OR it is the exception bot
     if event.is_group or event.is_channel:
         is_mention = await check_is_mention(msg, me)
         if is_exception or is_mention:
-            await forward_to_second(msg)
+            await forward_to_second(msg, input_chat=event.input_chat)
         return
 
 
@@ -809,6 +740,7 @@ async def on_reply_from_second(event: events.NewMessage.Event):
 
     orig_chat_id, orig_msg_id = mapping
     try:
+        orig_peer = await get_input_peer(orig_chat_id)
         is_file = (
             msg.media
             and not isinstance(
@@ -818,7 +750,7 @@ async def on_reply_from_second(event: events.NewMessage.Event):
         )
         if is_file:
             await client.send_file(
-                orig_chat_id,
+                orig_peer,
                 file=msg.media,
                 caption=msg.text or None,
                 reply_to=orig_msg_id,
@@ -828,7 +760,7 @@ async def on_reply_from_second(event: events.NewMessage.Event):
             )
         else:
             await client.send_message(
-                orig_chat_id,
+                orig_peer,
                 msg.text or "",
                 reply_to=orig_msg_id,
                 silent=True,
@@ -980,21 +912,14 @@ async def main():
         except Exception as e:
             log.warning("Could not start helper bot: %s", e)
 
-    # If second string session is provided, initialize communication so peer entity is cached
+    # If second string session is provided, initialize entity resolution
     if SECOND_SESSION_STRING:
         try:
             async with TelegramClient(StringSession(SECOND_SESSION_STRING), API_ID, API_HASH) as sec_client:
                 main_username = me.username or "pyrexus"
                 log.info("Handshake: Resolving main account @%s from second account...", main_username)
-                main_peer = await sec_client.get_entity(main_username)
-                await sec_client.send_message(
-                    main_peer,
-                    "🟢 **Telegram Bridge Initialized**\nYour bridge is now live and running on Railway.",
-                    silent=True,
-                )
-                log.info("Sent startup handshake from SECOND to MAIN (@%s)", main_username)
-                # Wait 2 seconds for main client to receive and process message
-                await asyncio.sleep(2)
+                await sec_client.get_entity(main_username)
+                log.info("Handshake: Resolved main account entity")
         except Exception as e:
             log.warning("Startup handshake note: %s", e)
 
@@ -1003,23 +928,7 @@ async def main():
 
     # Resolve target peer entity directly from client perspective
     target_peer = await get_second_entity()
-
-    # Send confirmation to second ID from main account
-    try:
-        await client.send_message(
-            target_peer,
-            f"🟢 **Telegram Bridge Bot is Live & Ready!**\n\n"
-            f"• **Main Account:** `{me.first_name}` (`{me.id}`)\n"
-            f"• **Target ID:** `{SECOND_ID}`\n"
-            f"• **Status:** Active & Forwarding (with Replied-Thread Context)\n"
-            f"• **Commands:** `/s <user>` to start new chat, `/status`, `/stats`\n"
-            f"• **Silent Mode:** Enabled (offline last-seen preserved)\n",
-            silent=True,
-        )
-        await enforce_offline()
-        log.info("Sent startup confirmation to SECOND_ID successfully")
-    except Exception as e:
-        log.warning("Could not send startup greeting to SECOND_ID: %s", e)
+    log.info("Resolved target_peer: %s", target_peer)
 
     # Start health server for Railway
     await start_health_server()

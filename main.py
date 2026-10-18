@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Silent Telegram Bridge Userbot
+Silent Telegram Bridge Userbot + Assistant Bot
 - Forwards DMs + media + voice notes + group mentions from MAIN account → SECOND_ID
 - Skips all bot messages except @nubuserbot (or EXCEPTION_BOT)
 - Reply bridge: reply on SECOND_ID to a forwarded msg → sends reply from MAIN account
-- /stats  → daily counters (msgs, media, mentions, vns)
-- /status → connection check
-- Never updates online / last-seen status
+- /stats  → daily counters (msgs, media, mentions, vns, replies)
+- /status → connection check (works from Main ID, Second ID, or via the Bot)
+- Never updates online / last-seen status (stealth mode)
 """
 
 import asyncio
@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
 from telethon.tl.custom.message import Message
-from telethon.errors import FloodWaitError, RPCError
+from telethon.errors import FloodWaitError
 
 load_dotenv()
 
@@ -28,13 +28,17 @@ load_dotenv()
 # Config
 # ---------------------------------------------------------------------------
 API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-SESSION_STRING = os.getenv("SESSION_STRING", "")
+API_HASH = os.getenv("API_HASH", "").strip()
+SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 SECOND_ID_RAW = os.getenv("SECOND_ID", "").strip()
 SECOND_SESSION_STRING = (
     os.getenv("SECOND_SESSION_STRING", "")
     or os.getenv("SECOND_ID_STRING", "")
 ).strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+EXCEPTION_BOT = (os.getenv("EXCEPTION_BOT") or "nubuserbot").lstrip("@").lower()
+TURSO_URL = os.getenv("TURSO_DATABASE_URL", "").strip()
+TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "").strip()
 
 SECOND_ID = 0
 if SECOND_ID_RAW.isdigit() or (SECOND_ID_RAW.startswith("-") and SECOND_ID_RAW[1:].isdigit()):
@@ -42,7 +46,7 @@ if SECOND_ID_RAW.isdigit() or (SECOND_ID_RAW.startswith("-") and SECOND_ID_RAW[1
 elif SECOND_ID_RAW.startswith("1"):
     SECOND_SESSION_STRING = SECOND_ID_RAW
 
-# If SECOND_ID is missing but we have a session string for the second account, resolve it now
+# Resolve SECOND_ID from string session if missing
 if SECOND_ID == 0 and SECOND_SESSION_STRING and API_ID and API_HASH:
     try:
         async def _resolve_sec_id():
@@ -54,14 +58,10 @@ if SECOND_ID == 0 and SECOND_SESSION_STRING and API_ID and API_HASH:
         _tmp_loop.close()
         print(f"Resolved SECOND_ID = {SECOND_ID}")
     except Exception as e:
-        print(f"Warning: Failed to resolve SECOND_ID from second string session: {e}")
-
-EXCEPTION_BOT = (os.getenv("EXCEPTION_BOT") or "nubuserbot").lstrip("@").lower()
-TURSO_URL = os.getenv("TURSO_DATABASE_URL", "")
-TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
+        print(f"Warning: Failed to resolve SECOND_ID: {e}")
 
 if not all([API_ID, API_HASH, SESSION_STRING, SECOND_ID]):
-    print("Missing required env vars: API_ID, API_HASH, SESSION_STRING, SECOND_ID (or SECOND_SESSION_STRING)")
+    print("Missing required env vars: API_ID, API_HASH, SESSION_STRING, SECOND_ID")
     sys.exit(1)
 
 logging.basicConfig(
@@ -72,7 +72,7 @@ logging.basicConfig(
 log = logging.getLogger("bridge")
 
 # ---------------------------------------------------------------------------
-# Database (Turso / libSQL)
+# Database (Turso / libSQL) with auto-reconnect
 # ---------------------------------------------------------------------------
 _db = None
 
@@ -112,18 +112,39 @@ def get_db():
 
 
 def db_exec(sql: str, params: tuple = ()):
-    db = get_db()
-    cur = db.execute(sql, params)
-    db.commit()
-    return cur
+    global _db
+    try:
+        db = get_db()
+        cur = db.execute(sql, params)
+        db.commit()
+        return cur
+    except Exception as e:
+        log.warning("DB query failed (%s). Reconnecting to Turso...", e)
+        _db = None
+        db = get_db()
+        cur = db.execute(sql, params)
+        db.commit()
+        return cur
 
 
 def db_fetchone(sql: str, params: tuple = ()):
-    return get_db().execute(sql, params).fetchone()
+    global _db
+    try:
+        return get_db().execute(sql, params).fetchone()
+    except Exception as e:
+        log.warning("DB fetchone failed (%s). Reconnecting...", e)
+        _db = None
+        return get_db().execute(sql, params).fetchone()
 
 
 def db_fetchall(sql: str, params: tuple = ()):
-    return get_db().execute(sql, params).fetchall()
+    global _db
+    try:
+        return get_db().execute(sql, params).fetchall()
+    except Exception as e:
+        log.warning("DB fetchall failed (%s). Reconnecting...", e)
+        _db = None
+        return get_db().execute(sql, params).fetchall()
 
 
 def bump_stat(kind: str, amount: int = 1):
@@ -153,7 +174,9 @@ def get_map(fwd_msg_id: int) -> Optional[tuple]:
 
 
 # ---------------------------------------------------------------------------
-# Client – silent, no online status
+# Telegram Clients
+# 1. client: Main user account (Silent listener & bridge sender)
+# 2. bot_client: Optional helper bot (@Panda_forward_Robot) for commands
 # ---------------------------------------------------------------------------
 client = TelegramClient(
     StringSession(SESSION_STRING),
@@ -161,46 +184,41 @@ client = TelegramClient(
     API_HASH,
     receive_updates=True,
     sequential_updates=True,
-    # Keep connection alive but do not announce presence
-    connection_retries=5,
+    connection_retries=10,
     retry_delay=2,
     auto_reconnect=True,
 )
 
+bot_client: Optional[TelegramClient] = None
+if BOT_TOKEN:
+    bot_client = TelegramClient("bot_session", API_ID, API_HASH)
 
-async def stay_offline():
-    """Periodically force offline status so last-seen stays old."""
-    while True:
-        try:
-            await client(functions.account.UpdateStatusRequest(offline=True))
-        except Exception as e:
-            log.debug("stay_offline: %s", e)
-        await asyncio.sleep(60)
+
+async def enforce_offline():
+    """Silently ensure last-seen status stays old/offline."""
+    try:
+        await client(functions.account.UpdateStatusRequest(offline=True))
+    except Exception as e:
+        log.debug("enforce_offline: %s", e)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def is_bot_sender(msg: Message) -> bool:
-    if not msg.sender:
-        return False
-    if getattr(msg.sender, "bot", False):
+async def check_is_mention(msg: Message, me: types.User) -> bool:
+    if msg.mentioned:
         return True
+    text = (msg.text or msg.message or "").lower()
+    if me.username and f"@{me.username.lower()}" in text:
+        return True
+    if msg.is_reply:
+        try:
+            rep = await msg.get_reply_message()
+            if rep and rep.sender_id == me.id:
+                return True
+        except Exception:
+            pass
     return False
-
-
-def is_exception_bot(msg: Message) -> bool:
-    if not msg.sender:
-        return False
-    uname = (getattr(msg.sender, "username", None) or "").lower()
-    return uname == EXCEPTION_BOT
-
-
-def is_mention_of_me(msg: Message, me_id: int) -> bool:
-    if not msg.mentioned:
-        return False
-    # Any message that Telegram flags as mentioning us
-    return True
 
 
 def media_kind(msg: Message) -> str:
@@ -232,84 +250,169 @@ async def format_header(msg: Message) -> str:
         uname = getattr(sender, "username", None)
         if uname:
             name += f" (@{uname})"
-        name += f" [{sender.id}]"
+        name += f" [{getattr(sender, 'id', 'unknown')}]"
 
-    chat_title = getattr(chat, "title", None) or "Private"
+    chat_title = getattr(chat, "title", None) or "Private DM"
     chat_id = msg.chat_id
 
     kind = "DM"
     if msg.is_group or msg.is_channel:
         kind = "GROUP"
-        if is_mention_of_me(msg, (await client.get_me()).id):
+        if msg.mentioned:
             kind = "MENTION"
 
+    time_str = msg.date.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if msg.date else ""
     return (
         f"── {kind} ──\n"
         f"From: {name}\n"
         f"Chat: {chat_title} ({chat_id})\n"
         f"MsgID: {msg.id}\n"
-        f"Time: {msg.date.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
+        f"Time: {time_str}\n"
         f"{'─' * 20}"
     )
 
 
 # ---------------------------------------------------------------------------
-# Core forward logic
+# Core Forward Logic
 # ---------------------------------------------------------------------------
-async def forward_to_second(msg: Message, header: str):
-    """Send a faithful copy of the message to SECOND_ID with header."""
+async def forward_to_second(msg: Message):
+    """Forward a message to SECOND_ID preserving media, voice notes, formatting, and header."""
     try:
-        # Text / caption
-        text = msg.text or msg.message or ""
-        full_text = f"{header}\n\n{text}" if text else header
+        header = await format_header(msg)
 
-        # Media
-        if msg.media:
-            sent = await client.send_file(
-                SECOND_ID,
-                file=msg.media,
-                caption=full_text[:1024],  # Telegram caption limit
-                voice_note=bool(msg.voice),
-                video_note=bool(msg.video_note),
-                silent=True,
+        # 1. Send the header card first
+        header_msg = await client.send_message(
+            SECOND_ID,
+            header,
+            silent=True,
+            link_preview=False,
+        )
+
+        # 2. Forward the content
+        sent = None
+        try:
+            # Native forward preserves voice note waveforms, video note circles, stickers, and albums
+            sent = await client.forward_messages(SECOND_ID, msg, silent=True)
+            if isinstance(sent, list):
+                sent = sent[0]
+        except Exception as fwd_err:
+            log.warning("Native forward fallback (%s): sending as copy", fwd_err)
+            is_file = (
+                msg.media
+                and not isinstance(
+                    msg.media,
+                    (types.MessageMediaWebPage, types.MessageMediaEmpty, types.MessageMediaUnsupported),
+                )
             )
-            kind = media_kind(msg)
-            bump_stat(kind)
-            bump_stat("media")
-        else:
-            sent = await client.send_message(
-                SECOND_ID,
-                full_text,
-                silent=True,
-                link_preview=False,
-            )
+            if is_file:
+                sent = await client.send_file(
+                    SECOND_ID,
+                    file=msg.media,
+                    caption=msg.text or None,
+                    voice_note=bool(msg.voice),
+                    video_note=bool(msg.video_note),
+                    silent=True,
+                )
+            else:
+                sent = await client.send_message(
+                    SECOND_ID,
+                    msg.text or "[Empty message or unsupported media]",
+                    silent=True,
+                    link_preview=True,
+                )
+            if isinstance(sent, list):
+                sent = sent[0]
 
-        # Map for reply bridge
-        if isinstance(sent, list):
-            sent = sent[0]
-        save_map(sent.id, msg.chat_id, msg.id)
+        # 3. Save mapping for reply bridge (map both header and forwarded message)
+        if header_msg:
+            save_map(header_msg.id, msg.chat_id, msg.id)
+        if sent:
+            save_map(sent.id, msg.chat_id, msg.id)
 
+        # 4. Bump stats
         bump_stat("messages")
         if msg.is_group or msg.is_channel:
             bump_stat("group_msgs")
-            if is_mention_of_me(msg, (await client.get_me()).id):
+            if msg.mentioned:
                 bump_stat("mentions")
         else:
             bump_stat("dms")
 
-        log.info("Forwarded %s → SECOND (map %s)", msg.id, sent.id)
+        if msg.media:
+            kind = media_kind(msg)
+            bump_stat(kind)
+            bump_stat("media")
+
+        # 5. Keep account offline
+        await enforce_offline()
+
+        log.info("Forwarded %s (chat %s) → SECOND_ID", msg.id, msg.chat_id)
         return sent
     except FloodWaitError as e:
         log.warning("FloodWait %ss – sleeping", e.seconds)
         await asyncio.sleep(e.seconds + 1)
-        return await forward_to_second(msg, header)
+        return await forward_to_second(msg)
     except Exception as e:
         log.exception("Forward failed: %s", e)
         return None
 
 
 # ---------------------------------------------------------------------------
-# Event handlers
+# Status & Stats Formatters
+# ---------------------------------------------------------------------------
+async def build_status_text() -> str:
+    me = await client.get_me()
+    connected = client.is_connected()
+    bot_name = "none"
+    if bot_client and bot_client.is_connected():
+        b_me = await bot_client.get_me()
+        bot_name = f"@{b_me.username}" if b_me else "active"
+
+    return (
+        f"✅ **Telegram Bridge Status**\n\n"
+        f"• **Main Account:** {me.first_name} (`{me.id}`)\n"
+        f"• **Username:** @{me.username or 'none'}\n"
+        f"• **Main Connected:** {connected}\n"
+        f"• **Second Target ID:** `{SECOND_ID}`\n"
+        f"• **Assistant Bot:** {bot_name}\n"
+        f"• **Silent Stealth Mode:** Active (offline status preserved)\n"
+        f"• **Exception Bot:** @{EXCEPTION_BOT}\n"
+        f"• **Database:** {'Turso libSQL' if TURSO_URL else 'Local SQLite'}"
+    )
+
+
+def build_stats_text(arg: str = "") -> str:
+    arg = (arg or "").strip().lower()
+    today = date.today().isoformat()
+
+    if arg in ("", "today"):
+        rows = db_fetchall(
+            "SELECT kind, count FROM daily_stats WHERE day = ? ORDER BY kind",
+            (today,),
+        )
+        if not rows:
+            return f"📊 **Stats for {today}**\n\nNo activity recorded yet today."
+        lines = [f"📊 **Stats for {today}**\n"]
+        for kind, cnt in rows:
+            lines.append(f"• **{kind}**: {cnt}")
+        return "\n".join(lines)
+
+    if arg == "all":
+        rows = db_fetchall(
+            "SELECT day, kind, count FROM daily_stats ORDER BY day DESC, kind LIMIT 100"
+        )
+        if not rows:
+            return "📊 No stats recorded yet."
+        lines = ["📊 **Recent Stats History**\n"]
+        for day, kind, cnt in rows:
+            lines.append(f"`{day}` | **{kind}**: {cnt}")
+        return "\n".join(lines)
+
+    return "Usage: `/stats` or `/stats all`"
+
+
+# ---------------------------------------------------------------------------
+# Userbot Event Handlers
 # ---------------------------------------------------------------------------
 @client.on(events.NewMessage(incoming=True))
 async def on_new_message(event: events.NewMessage.Event):
@@ -320,41 +423,82 @@ async def on_new_message(event: events.NewMessage.Event):
     if msg.out or msg.sender_id == me.id:
         return
 
-    # Never re-forward messages that come from the second account
-    # (prevents loops with the reply bridge)
+    # Check if message is from the second account
     if msg.sender_id == SECOND_ID:
+        text_strip = (msg.text or "").strip().lower()
+
+        # Allow /status, /stats, /help, /ping from second ID
+        if text_strip.startswith("/status"):
+            status_text = await build_status_text()
+            await event.reply(status_text, silent=True)
+            return
+
+        if text_strip.startswith("/stats"):
+            parts = text_strip.split(maxsplit=1)
+            arg = parts[1] if len(parts) > 1 else ""
+            await event.reply(build_stats_text(arg), silent=True)
+            return
+
+        if text_strip.startswith("/help") or text_strip.startswith("/start"):
+            await event.reply(
+                "ℹ️ **Bridge Help**\n\n"
+                "• All DMs and group mentions to your main account are forwarded here.\n"
+                "• **Reply** to any forwarded message to reply from your main account.\n"
+                "• `/status` - Check bridge connection\n"
+                "• `/stats` - View today's stats\n"
+                "• `/stats all` - View recent history\n",
+                silent=True,
+            )
+            return
+
+        # If it's a reply to one of our forwarded messages, let the reply handler process it
+        if msg.is_reply:
+            return
+
+        # If it's an arbitrary message from SECOND_ID, give a quick helpful reply
+        await event.reply(
+            "ℹ️ **Bridge Active**\n"
+            f"This chat is connected to your main account @{me.username or me.id}.\n"
+            "• Messages from other users will be forwarded here.\n"
+            "• Reply to any forwarded message to send a reply back from your main account.\n"
+            "• Send `/status` or `/stats` anytime.",
+            silent=True,
+        )
         return
 
+    # Identify sender
+    sender = await msg.get_sender()
+    is_bot = getattr(sender, "bot", False) if sender else False
+    uname = (getattr(sender, "username", "") or "").lower()
+    is_exception = uname == EXCEPTION_BOT
+
     # Skip bots except the allowed exception
-    if is_bot_sender(msg) and not is_exception_bot(msg):
+    if is_bot and not is_exception:
         return
 
     # Private chats (DMs) – always forward
     if event.is_private:
-        header = await format_header(msg)
-        await forward_to_second(msg, header)
+        await forward_to_second(msg)
         return
 
     # Groups / channels – only if we are mentioned OR it is the exception bot
     if event.is_group or event.is_channel:
-        if is_exception_bot(msg) or is_mention_of_me(msg, me.id):
-            header = await format_header(msg)
-            await forward_to_second(msg, header)
+        is_mention = await check_is_mention(msg, me)
+        if is_exception or is_mention:
+            await forward_to_second(msg)
         return
 
 
 @client.on(events.NewMessage(chats=SECOND_ID, incoming=True))
 async def on_reply_from_second(event: events.NewMessage.Event):
     """
-    Main account sees messages from SECOND_ID as *incoming* in the private
-    chat with SECOND_ID. When SECOND_ID replies to one of our forwarded
-    messages, look up the original chat+msg and send the reply from MAIN.
+    When SECOND_ID replies to a forwarded message, look up the original
+    chat and message ID and send the reply from the MAIN user account.
     """
     msg: Message = event.message
     if not msg.is_reply:
         return
 
-    # Only care about messages that come from the second account
     if msg.sender_id != SECOND_ID:
         return
 
@@ -368,12 +512,21 @@ async def on_reply_from_second(event: events.NewMessage.Event):
 
     orig_chat_id, orig_msg_id = mapping
     try:
-        if msg.media:
+        is_file = (
+            msg.media
+            and not isinstance(
+                msg.media,
+                (types.MessageMediaWebPage, types.MessageMediaEmpty, types.MessageMediaUnsupported),
+            )
+        )
+        if is_file:
             await client.send_file(
                 orig_chat_id,
                 file=msg.media,
                 caption=msg.text or None,
                 reply_to=orig_msg_id,
+                voice_note=bool(msg.voice),
+                video_note=bool(msg.video_note),
                 silent=True,
             )
         else:
@@ -386,6 +539,7 @@ async def on_reply_from_second(event: events.NewMessage.Event):
             )
         log.info("Bridge reply → chat %s msg %s", orig_chat_id, orig_msg_id)
         bump_stat("replies_bridged")
+        await enforce_offline()
     except Exception as e:
         log.exception("Reply bridge failed: %s", e)
         try:
@@ -398,62 +552,21 @@ async def on_reply_from_second(event: events.NewMessage.Event):
             pass
 
 
-# ---------------------------------------------------------------------------
-# Commands (only accepted from MAIN account itself)
-# ---------------------------------------------------------------------------
-@client.on(events.NewMessage(outgoing=True, pattern=r"^/status$"))
-async def cmd_status(event: events.NewMessage.Event):
-    me = await client.get_me()
-    connected = client.is_connected()
-    text = (
-        f"✅ Status\n"
-        f"Connected: {connected}\n"
-        f"Main ID: {me.id}\n"
-        f"Username: @{me.username or 'none'}\n"
-        f"Second ID: {SECOND_ID}\n"
-        f"Exception bot: @{EXCEPTION_BOT}\n"
-        f"DB: {'Turso' if TURSO_URL else 'local'}"
-    )
+# Commands sent by MAIN account itself (anywhere or in Saved Messages)
+@client.on(events.NewMessage(outgoing=True, pattern=r"^/status(?:\s.*)?$"))
+async def cmd_status_main(event: events.NewMessage.Event):
+    text = await build_status_text()
     await event.reply(text, silent=True)
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^/stats(?:\s+(.+))?$"))
-async def cmd_stats(event: events.NewMessage.Event):
-    arg = (event.pattern_match.group(1) or "").strip().lower()
-    today = date.today().isoformat()
-
-    if arg in ("", "today"):
-        rows = db_fetchall(
-            "SELECT kind, count FROM daily_stats WHERE day = ? ORDER BY kind",
-            (today,),
-        )
-        if not rows:
-            await event.reply(f"📊 No stats for {today} yet.", silent=True)
-            return
-        lines = [f"📊 Stats for {today}"]
-        for kind, cnt in rows:
-            lines.append(f"• {kind}: {cnt}")
-        await event.reply("\n".join(lines), silent=True)
-        return
-
-    if arg == "all":
-        rows = db_fetchall(
-            "SELECT day, kind, count FROM daily_stats ORDER BY day DESC, kind LIMIT 100"
-        )
-        if not rows:
-            await event.reply("📊 No stats recorded yet.", silent=True)
-            return
-        lines = ["📊 Recent stats (last 100 rows)"]
-        for day, kind, cnt in rows:
-            lines.append(f"{day} | {kind}: {cnt}")
-        await event.reply("\n".join(lines), silent=True)
-        return
-
-    await event.reply("Usage: /stats  or  /stats all", silent=True)
+async def cmd_stats_main(event: events.NewMessage.Event):
+    arg = (event.pattern_match.group(1) or "").strip()
+    await event.reply(build_stats_text(arg), silent=True)
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=r"^/help$"))
-async def cmd_help(event: events.NewMessage.Event):
+@client.on(events.NewMessage(outgoing=True, pattern=r"^/help(?:\s.*)?$"))
+async def cmd_help_main(event: events.NewMessage.Event):
     text = (
         "Bridge Userbot commands (send from main account):\n"
         "/status – connection & config\n"
@@ -469,7 +582,36 @@ async def cmd_help(event: events.NewMessage.Event):
     await event.reply(text, silent=True)
 
 
-# Optional HTTP server for Railway / PaaS health checks
+# ---------------------------------------------------------------------------
+# Helper Bot (@Panda_forward_Robot) Event Handlers
+# Allows interacting with the bridge via the bot from any account
+# ---------------------------------------------------------------------------
+if bot_client:
+    @bot_client.on(events.NewMessage(pattern=r"^/(start|help)"))
+    async def bot_start(event: events.NewMessage.Event):
+        await event.reply(
+            "🤖 **Telegram Bridge Assistant Bot**\n\n"
+            "This bot monitors your Telegram bridge.\n\n"
+            "Commands:\n"
+            "• `/status` - Check live connection & status\n"
+            "• `/stats` - View today's stats\n"
+            "• `/stats all` - View recent history\n"
+        )
+
+    @bot_client.on(events.NewMessage(pattern=r"^/status"))
+    async def bot_status(event: events.NewMessage.Event):
+        text = await build_status_text()
+        await event.reply(text)
+
+    @bot_client.on(events.NewMessage(pattern=r"^/stats(?:\s+(.+))?"))
+    async def bot_stats(event: events.NewMessage.Event):
+        arg = (event.pattern_match.group(1) or "").strip()
+        await event.reply(build_stats_text(arg))
+
+
+# ---------------------------------------------------------------------------
+# HTTP Health Check Server (Railway / PaaS)
+# ---------------------------------------------------------------------------
 async def start_health_server():
     port_str = os.getenv("PORT")
     if not port_str:
@@ -478,8 +620,10 @@ async def start_health_server():
         from aiohttp import web
         port = int(port_str)
         app = web.Application()
+
         async def handle_ping(request):
             return web.Response(text="OK - Telegram Bridge Userbot is running\n")
+
         app.router.add_get("/", handle_ping)
         app.router.add_get("/health", handle_ping)
         runner = web.AppRunner(app)
@@ -497,6 +641,7 @@ async def start_health_server():
 async def main():
     get_db()  # init tables
 
+    log.info("Connecting user client...")
     await client.connect()
     if not await client.is_user_authorized():
         log.error("Session string is invalid or expired. Generate a new one.")
@@ -506,19 +651,56 @@ async def main():
     log.info("Logged in as %s (%s) – silent mode", me.first_name, me.id)
 
     # Force offline immediately
+    await enforce_offline()
+
+    # Start helper bot client if configured
+    if bot_client:
+        try:
+            await bot_client.start(bot_token=BOT_TOKEN)
+            b_me = await bot_client.get_me()
+            log.info("Helper bot started as @%s", b_me.username)
+        except Exception as e:
+            log.warning("Could not start helper bot: %s", e)
+
+    # If second string session is provided, initialize communication so peer entity is cached
+    if SECOND_SESSION_STRING:
+        try:
+            async with TelegramClient(StringSession(SECOND_SESSION_STRING), API_ID, API_HASH) as sec_client:
+                # Ensure second account has opened chat with main account so peer cache is populated
+                await sec_client.send_message(
+                    me.id,
+                    "🟢 **Telegram Bridge Initialized**\nYour bridge is now live and running on Railway.",
+                    silent=True,
+                )
+                log.info("Sent startup handshake from SECOND to MAIN")
+        except Exception as e:
+            log.warning("Startup handshake note: %s", e)
+
+    # Send confirmation to second ID from main account
     try:
-        await client(functions.account.UpdateStatusRequest(offline=True))
-    except Exception:
-        pass
+        await client.send_message(
+            SECOND_ID,
+            f"🟢 **Telegram Bridge Bot is Live & Ready!**\n\n"
+            f"• **Main Account:** `{me.first_name}` (`{me.id}`)\n"
+            f"• **Target ID:** `{SECOND_ID}`\n"
+            f"• **Status:** Active & Forwarding\n"
+            f"• **Silent Mode:** Enabled (offline last-seen preserved)\n\n"
+            f"Send `/status` or `/stats` anytime to check status.",
+            silent=True,
+        )
+        await enforce_offline()
+    except Exception as e:
+        log.warning("Could not send startup greeting to SECOND_ID: %s", e)
 
-    # Background task to keep last-seen frozen
-    asyncio.create_task(stay_offline())
-
-    # Start optional health server if Railway assigned a PORT
+    # Start health server for Railway
     await start_health_server()
 
-    log.info("Bridge running. Forwarding → %s", SECOND_ID)
-    await client.run_until_disconnected()
+    log.info("Bridge fully running. Forwarding → %s", SECOND_ID)
+
+    tasks = [client.run_until_disconnected()]
+    if bot_client:
+        tasks.append(bot_client.run_until_disconnected())
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
